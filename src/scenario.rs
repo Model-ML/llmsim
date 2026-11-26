@@ -56,6 +56,11 @@ pub enum ValueRange {
 const Z99: f64 = 2.326_347_874;
 
 impl ValueRange {
+    #[cfg(feature = "server")]
+    pub(crate) fn sample_random(&self) -> u64 {
+        self.sample(&mut SplitMix64::new(rand::random()))
+    }
+
     fn sample(&self, rng: &mut SplitMix64) -> u64 {
         match *self {
             ValueRange::Fixed(v) => v,
@@ -74,7 +79,7 @@ impl ValueRange {
         }
     }
 
-    fn validate(&self, field: &str) -> Result<(), String> {
+    pub(crate) fn validate(&self, field: &str) -> Result<(), String> {
         match *self {
             ValueRange::Between([min, max]) if min > max => Err(format!(
                 "{field}: range min {min} is greater than max {max}"
@@ -711,6 +716,8 @@ impl From<&crate::openai::Tool> for ToolSpec {
 /// Why a request could not be resolved to a step.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ResolveError {
+    #[error("Invalid llmsim turn shape. Expected s=t2,t1,o300 seed=42 (at most 128 calls per step and 32768 final tokens)")]
+    InvalidTurnShape,
     #[error("Unknown llmsim scenario '{name}'. Known scenarios: {}", if known.is_empty() { "(none)".to_string() } else { known.join(", ") })]
     UnknownScenario { name: String, known: Vec<String> },
     #[error("llmsim scenario '{scenario}' step {step} calls tool '{tool}', which the request does not offer. Offered tools: {}", if offered.is_empty() { "(none)".to_string() } else { offered.join(", ") })]
@@ -805,6 +812,10 @@ impl Resolution {
     /// always fail), then a background `error_rate` draw. The stream is cut
     /// only on the first attempt past `fail_first`, so a retry succeeds.
     pub fn outcome(&self, attempt: u32) -> AttemptOutcome {
+        self.outcome_with_seed(attempt, None)
+    }
+
+    pub(crate) fn outcome_with_seed(&self, attempt: u32, run_seed: Option<i64>) -> AttemptOutcome {
         let a = attempt as usize;
         if let Some(err) = self.fail_first.get(a) {
             return AttemptOutcome::Fail(err.clone());
@@ -813,8 +824,11 @@ impl Resolution {
             return AttemptOutcome::Fail(err.clone());
         }
         if !self.error_rate.is_empty() {
+            let seed = run_seed.map_or(self.fingerprint, |seed| {
+                hash_parts(&[&seed.to_le_bytes(), &self.fingerprint.to_le_bytes()])
+            });
             let mut rng = SplitMix64::new(hash_parts(&[
-                &self.fingerprint.to_le_bytes(),
+                &seed.to_le_bytes(),
                 b"error_rate",
                 &attempt.to_le_bytes(),
             ]));
@@ -837,6 +851,156 @@ impl Resolution {
     }
 }
 
+/// The same step counter is used for inline playback and seeded faults.
+#[cfg(feature = "server")]
+pub(crate) fn tool_rounds(messages: &[ConversationMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|message| {
+            message.role == MessageRole::Assistant && !message.tool_call_ids.is_empty()
+        })
+        .count()
+}
+
+#[cfg(feature = "server")]
+pub(crate) fn resolve_turn_shape(
+    messages: &[ConversationMessage],
+    tools: &[ToolSpec],
+    allowlist: &[String],
+    output_cap: Option<u32>,
+    fallback_tokens: usize,
+) -> Result<Option<(Resolution, bool)>, ResolveError> {
+    let Some(first_user) = messages.iter().position(|m| m.role == MessageRole::User) else {
+        return Ok(None);
+    };
+    let text = &messages[first_user].text;
+    if !text.contains("[[llmsim:s=") {
+        return Ok(None);
+    }
+    let (payload, seed) = turn_shape_payload(text).ok_or(ResolveError::InvalidTurnShape)?;
+    let shape = payload.split_once(" seed=").unwrap().0;
+    // Read one extra item so an oversized shape is rejected without
+    // allocating a vector sized to the incoming prompt.
+    let mut steps = shape.split(',').take(130).collect::<Vec<_>>();
+    let count = |part: &str, prefix, limit| {
+        part.strip_prefix(prefix)
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|n| n.parse::<usize>().ok())
+            .filter(|&n| n > 0 && n <= limit)
+            .ok_or(ResolveError::InvalidTurnShape)
+    };
+    let final_tokens = count(steps.pop().unwrap_or_default(), 'o', 32_768)?;
+    if steps.len() > 128 {
+        return Err(ResolveError::InvalidTurnShape);
+    }
+    let calls = steps
+        .into_iter()
+        .map(|s| count(s, 't', 128))
+        .collect::<Result<Vec<_>, _>>()?;
+    let step = tool_rounds(&messages[first_user + 1..]);
+    let session = turn_shape_session(payload, seed);
+    let fingerprint = hash_parts(&[&session.to_le_bytes(), &(step as u64).to_le_bytes()]);
+    let mut rng = SplitMix64::new(fingerprint);
+    let cap = output_cap.map_or(32_768, |cap| cap as usize);
+    let mut substituted = false;
+    let turn = if let Some(&n) = calls.get(step) {
+        let mut candidates = tools
+            .iter()
+            .filter(|tool| {
+                !tool.name.is_empty() && (allowlist.is_empty() || allowlist.contains(&tool.name))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| a.name.cmp(&b.name));
+        candidates.dedup_by(|a, b| a.name == b.name);
+        if candidates.is_empty() {
+            substituted = true;
+            SimTurn::Assistant {
+                text: shape_text(fallback_tokens.clamp(1, 32_768).min(cap), &mut rng),
+            }
+        } else {
+            // Shuffle once, then cycle when more calls than distinct tools are requested.
+            for i in (1..candidates.len()).rev() {
+                let j = rng.below(i as u64 + 1) as usize;
+                candidates.swap(i, j);
+            }
+            let calls = candidates
+                .iter()
+                .cycle()
+                .take(n)
+                .enumerate()
+                .map(|(i, tool)| {
+                    let seed = rng.next_u64();
+                    SimToolCall {
+                        name: tool.name.clone(),
+                        arguments: tool
+                            .parameters
+                            .as_ref()
+                            .map(|schema| crate::schema_fake::fake_from_schema(schema, seed))
+                            .unwrap_or_else(|| serde_json::json!({})),
+                        id: Some(format!("call_{fingerprint:016x}_{i}")),
+                    }
+                })
+                .collect();
+            SimTurn::ToolCalls { calls }
+        }
+    } else {
+        SimTurn::Assistant {
+            text: shape_text(final_tokens.min(cap), &mut rng),
+        }
+    };
+    Ok(Some((
+        Resolution {
+            scenario: "turn-shape".into(),
+            step,
+            step_index: step.min(calls.len()),
+            turn,
+            reasoning: None,
+            timing: ResolvedTiming {
+                ttft: None,
+                inter_token: None,
+                stall: None,
+                cut_after_tokens: None,
+                speed: 1.0,
+            },
+            fail_first: Vec::new(),
+            error_rate: Vec::new(),
+            fingerprint,
+            turn_error: None,
+        },
+        substituted,
+    )))
+}
+
+#[cfg(feature = "server")]
+fn shape_text(tokens: usize, rng: &mut SplitMix64) -> String {
+    crate::tokens::truncate_output_tokens(lorem_text(tokens, rng), tokens)
+}
+
+#[cfg(feature = "server")]
+pub(crate) fn turn_shape_session(payload: &str, seed: i64) -> u64 {
+    hash_parts(&[payload.as_bytes(), &seed.to_le_bytes()])
+}
+
+#[cfg(feature = "server")]
+pub(crate) fn turn_shape_payload(text: &str) -> Option<(&str, i64)> {
+    let (_, tail) = text.split_once("[[llmsim:s=")?;
+    let (payload, _) = tail.split_once("]]")?;
+    let (_, seed) = payload.split_once(" seed=")?;
+    Some((payload, seed.parse().ok()?))
+}
+
+/// Domain-separated random seed for a fault on a particular SDK attempt.
+#[cfg(feature = "server")]
+pub(crate) fn fault_seed(run_seed: i64, session: u64, step: usize, attempt: u32) -> u64 {
+    hash_parts(&[
+        b"fault",
+        &run_seed.to_le_bytes(),
+        &session.to_le_bytes(),
+        &(step as u64).to_le_bytes(),
+        &attempt.to_le_bytes(),
+    ])
+}
+
 /// Resolve which scenario step a request plays. A pure function of its
 /// inputs: any worker or process returns the same answer.
 ///
@@ -849,10 +1013,34 @@ pub fn resolve(
     model: Option<&str>,
     set: &ScenarioSet,
 ) -> Result<Option<Resolution>, ResolveError> {
+    resolve_with_parser(messages, tools, model, set, parse_marker)
+}
+
+#[cfg(feature = "server")]
+pub(crate) fn resolve_http_named(
+    messages: &[ConversationMessage],
+    tools: &[ToolSpec],
+    model: Option<&str>,
+    set: &ScenarioSet,
+) -> Result<Option<Resolution>, ResolveError> {
+    resolve_with_parser(messages, tools, model, set, |text| {
+        text.match_indices(MARKER_PREFIX)
+            .find(|(start, _)| !text[start + MARKER_PREFIX.len()..].starts_with("s="))
+            .and_then(|(start, _)| parse_marker(&text[start..]))
+    })
+}
+
+fn resolve_with_parser(
+    messages: &[ConversationMessage],
+    tools: &[ToolSpec],
+    model: Option<&str>,
+    set: &ScenarioSet,
+    parse: impl FnOnce(&str) -> Option<Marker>,
+) -> Result<Option<Resolution>, ResolveError> {
     let user_idx = messages.iter().rposition(|m| m.role == MessageRole::User);
     let user_text = user_idx.map(|i| messages[i].text.as_str()).unwrap_or("");
 
-    let marker = parse_marker(user_text).or_else(|| {
+    let marker = parse(user_text).or_else(|| {
         model
             .and_then(|m| m.strip_prefix(MODEL_PREFIX))
             .map(|name| Marker {

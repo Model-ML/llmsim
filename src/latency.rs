@@ -39,6 +39,63 @@ pub struct LatencyProfile {
 /// Default prefill cost: about 20k input tokens per second.
 pub const DEFAULT_PREFILL_US_PER_TOKEN: u64 = 50;
 
+/// Schedule output against one clock so timer rounding and work between
+/// chunks do not add a full scheduling delay to every token.
+pub(crate) struct StreamPacer {
+    tokens: u64,
+    tps: f64,
+    start: Option<tokio::time::Instant>,
+    fraction: f64,
+    complete: Box<dyn FnOnce(u64, Duration) + Send>,
+}
+
+impl StreamPacer {
+    #[cfg(feature = "server")]
+    pub(crate) fn new(
+        tokens: u64,
+        tps: f64,
+        complete: impl FnOnce(u64, Duration) + Send + 'static,
+    ) -> Self {
+        Self {
+            tokens,
+            tps,
+            start: None,
+            fraction: 0.0,
+            complete: Box::new(complete),
+        }
+    }
+
+    pub(crate) async fn wait(&mut self, fraction: f64) {
+        let start = *self.start.get_or_insert_with(tokio::time::Instant::now);
+        self.fraction += fraction;
+        let delay = Duration::from_secs_f64((self.tokens as f64 / self.tps) * self.fraction);
+        tokio::time::sleep_until(start + delay).await;
+    }
+
+    pub(crate) fn finish(self) {
+        if let Some(start) = self.start {
+            if self.tokens > 0 {
+                (self.complete)(self.tokens, start.elapsed());
+            }
+        }
+    }
+}
+
+pub(crate) async fn pace_chunk(
+    pacer: &mut Option<StreamPacer>,
+    chunks: usize,
+    legacy_delay: impl FnOnce() -> Duration,
+) {
+    if let Some(pacer) = pacer {
+        pacer.wait(1.0 / chunks.max(1) as f64).await;
+    } else {
+        let delay = legacy_delay();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+
 impl LatencyProfile {
     /// Create a new latency profile with custom values
     pub fn new(

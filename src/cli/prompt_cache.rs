@@ -114,22 +114,41 @@ impl PromptCache {
     /// OpenAI automatic caching: cached tokens for a prompt of `total`
     /// tokens with message-boundary `prefixes`.
     pub fn openai(&self, prefixes: &[Prefix], total: usize, now: Instant) -> usize {
+        self.openai_usage(prefixes, total, now).0
+    }
+
+    /// Report cache reads and newly written tokens at the same prefix boundaries.
+    pub(super) fn openai_usage(
+        &self,
+        prefixes: &[Prefix],
+        total: usize,
+        now: Instant,
+    ) -> (usize, usize) {
         if total < MIN_CACHEABLE_TOKENS {
-            return 0;
+            return (0, 0);
         }
         let cacheable: Vec<Prefix> = prefixes
             .iter()
             .copied()
             .filter(|p| p.tokens >= MIN_CACHEABLE_TOKENS)
             .collect();
-        let hit = self
-            .lookup_and_store(&cacheable, &cacheable, now)
-            .min(total);
-        if hit < MIN_CACHEABLE_TOKENS {
-            return 0;
-        }
-        MIN_CACHEABLE_TOKENS
-            + (hit - MIN_CACHEABLE_TOKENS) / OPENAI_CACHE_INCREMENT * OPENAI_CACHE_INCREMENT
+        let rounded = |tokens: usize| {
+            if tokens < MIN_CACHEABLE_TOKENS {
+                0
+            } else {
+                MIN_CACHEABLE_TOKENS
+                    + (tokens - MIN_CACHEABLE_TOKENS) / OPENAI_CACHE_INCREMENT
+                        * OPENAI_CACHE_INCREMENT
+            }
+        };
+        let hit = rounded(
+            self.lookup_and_store(&cacheable, &cacheable, now)
+                .min(total),
+        );
+        let written = cacheable
+            .last()
+            .map_or(0, |prefix| rounded(prefix.tokens.min(total)));
+        (hit, written.saturating_sub(hit))
     }
 
     /// Anthropic explicit caching over `breakpoints` (prefixes that end at a

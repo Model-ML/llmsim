@@ -46,6 +46,11 @@ The OpenAI Responses API is a stateful API that unifies the Chat Completions and
 **R2.2**: Support content part types in message content arrays:
 - `input_text`: `{"type": "input_text", "text": "..."}`
 - `input_image`: `{"type": "input_image", "image_url": "..."}`
+- Replayed assistant `output_text` and `refusal` parts.
+
+**R2.4**: Accept explicit history containing assistant messages, function calls,
+reasoning items, and function-call outputs with string or typed content-list
+results. Optional output metadata may accompany replayed items.
 
 **R2.3**: Each `input_image` part contributes an approximate token cost to `usage.input_tokens`. The simulator does not fetch or decode image bytes, so the cost is approximated rather than computed from pixel dimensions: 765 tokens per image (a representative high-detail image under OpenAI's tile formula). Image inputs do not influence the generated output text.
 
@@ -137,12 +142,12 @@ Support reasoning configuration for reasoning models (o-series and GPT-5 family)
 and reports the reasoning capability; IDs without a profile fall back to the
 `o1`/`o3`/`o4`/`gpt-5*`/`gpt-6*` name patterns.
 
-**R4.3.2**: Include reasoning tokens in usage statistics:
+**R4.3.2**: Include reasoning tokens within `output_tokens` and report the breakdown:
 ```json
 {
   "usage": {
     "input_tokens": 100,
-    "output_tokens": 50,
+    "output_tokens": 200,
     "total_tokens": 300,
     "output_tokens_details": {
       "reasoning_tokens": 150
@@ -188,11 +193,13 @@ data: <json_payload>
 
 ### R6: Usage Statistics
 
-**R6.1**: Return token usage in completed responses:
+**R6.1**: Return token usage in completed responses. Input details include
+cache reads and estimated writes for GPT-5.6 and later.
 ```json
 {
   "usage": {
     "input_tokens": 100,
+    "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
     "output_tokens": 50,
     "total_tokens": 150,
     "output_tokens_details": {
@@ -391,7 +398,7 @@ curl -X POST http://localhost:8080/openai/v1/responses \
   "output_text": "2 + 2 = 4.",
   "usage": {
     "input_tokens": 5,
-    "output_tokens": 8,
+    "output_tokens": 32,
     "total_tokens": 37,
     "output_tokens_details": {
       "reasoning_tokens": 24

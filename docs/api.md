@@ -215,7 +215,7 @@ The response includes a `reasoning` output item before the `message`:
   ],
   "usage": {
     "input_tokens": 5,
-    "output_tokens": 8,
+    "output_tokens": 32,
     "total_tokens": 37,
     "output_tokens_details": {"reasoning_tokens": 24}
   }

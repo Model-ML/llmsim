@@ -1,0 +1,60 @@
+name: Publish GHCR image
+
+on:
+  push:
+    # mml-* branches publish a SHA-tagged image so a load-test preview can run a fix before it merges.
+    branches: [main, 'mml-*']
+    tags: ['v*']
+
+permissions:
+  packages: write
+  contents: read
+
+concurrency:
+  group: publish-ghcr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: github.repository_owner == 'Model-ML'
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/model-ml/llmsim
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        env:
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          docker build \
+            --label "org.opencontainers.image.source=$SOURCE" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$IMAGE:$GITHUB_SHA" .
+
+      - name: Generate image SBOM
+        uses: anchore/sbom-action@a930d0ac434e3182448fe678398ba5713717112a # v0.21.0
+        with:
+          image: docker:${{ env.IMAGE }}:${{ github.sha }}
+          format: spdx-json
+          output-file: llmsim.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Upload image SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: llmsim-sbom-${{ github.sha }}
+          path: llmsim.spdx.json
+          if-no-files-found: error
+
+      - name: Push image tags
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:$GITHUB_REF_NAME"
+          docker push "$IMAGE:$GITHUB_REF_NAME"

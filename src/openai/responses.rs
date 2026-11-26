@@ -30,6 +30,12 @@ pub enum InputItem {
     },
     /// A function call result (tool output)
     FunctionCallOutput { call_id: String, output: String },
+    /// A tool result with structured input content, including cache breakpoints.
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutputParts {
+        call_id: String,
+        output: Vec<ContentPart>,
+    },
     /// A function call the model made earlier, sent back as history.
     FunctionCall {
         call_id: String,
@@ -40,6 +46,18 @@ pub enum InputItem {
     Reasoning {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+    },
+    /// Provider-hosted search already executed in the replayed history.
+    WebSearchCall {
+        #[serde(flatten)]
+        fields: serde_json::Map<String, serde_json::Value>,
+    },
+    /// A previously recorded reasoning configuration update.
+    ConfigurationUpdate { reasoning: serde_json::Value },
+    /// Dynamic tool definitions carried in a developer history item.
+    AdditionalTools {
+        role: InputRole,
+        tools: Vec<serde_json::Value>,
     },
 }
 
@@ -78,10 +96,17 @@ impl<'de> serde::Deserialize<'de> for InputItem {
                     .to_string();
                 let output = obj
                     .get("output")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| serde::de::Error::missing_field("output"))?
-                    .to_string();
-                Ok(InputItem::FunctionCallOutput { call_id, output })
+                    .ok_or_else(|| serde::de::Error::missing_field("output"))?;
+                if let Some(output) = output.as_str() {
+                    Ok(InputItem::FunctionCallOutput {
+                        call_id,
+                        output: output.to_string(),
+                    })
+                } else {
+                    let output = Vec::<ContentPart>::deserialize(output)
+                        .map_err(serde::de::Error::custom)?;
+                    Ok(InputItem::FunctionCallOutputParts { call_id, output })
+                }
             }
             Some("function_call") => {
                 let field = |name: &'static str| {
@@ -99,6 +124,27 @@ impl<'de> serde::Deserialize<'de> for InputItem {
             Some("reasoning") => Ok(InputItem::Reasoning {
                 id: obj.get("id").and_then(|v| v.as_str()).map(str::to_string),
             }),
+            Some("web_search_call") => {
+                let mut fields = obj.clone();
+                fields.remove("type");
+                Ok(InputItem::WebSearchCall { fields })
+            }
+            Some("configuration_update") => Ok(InputItem::ConfigurationUpdate {
+                reasoning: obj
+                    .get("reasoning")
+                    .cloned()
+                    .ok_or_else(|| serde::de::Error::missing_field("reasoning"))?,
+            }),
+            Some("additional_tools") => {
+                let tools = obj
+                    .get("tools")
+                    .ok_or_else(|| serde::de::Error::missing_field("tools"))?;
+                Ok(InputItem::AdditionalTools {
+                    role: InputRole::Developer,
+                    tools: Vec::<serde_json::Value>::deserialize(tools)
+                        .map_err(serde::de::Error::custom)?,
+                })
+            }
             Some(other) => Err(serde::de::Error::unknown_variant(
                 other,
                 &[
@@ -106,6 +152,9 @@ impl<'de> serde::Deserialize<'de> for InputItem {
                     "function_call_output",
                     "function_call",
                     "reasoning",
+                    "web_search_call",
+                    "configuration_update",
+                    "additional_tools",
                 ],
             )),
             None => Err(serde::de::Error::custom(
@@ -140,9 +189,20 @@ pub enum MessageContent {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     /// Text content
-    InputText { text: String },
+    InputText {
+        text: String,
+    },
+    /// Text or refusal from a replayed assistant message.
+    OutputText {
+        text: String,
+    },
+    Refusal {
+        refusal: String,
+    },
     /// Image content
-    InputImage { image_url: String },
+    InputImage {
+        image_url: String,
+    },
     /// File content
     InputFile {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,6 +210,17 @@ pub enum ContentPart {
         #[serde(skip_serializing_if = "Option::is_none")]
         file_id: Option<String>,
     },
+}
+
+impl ContentPart {
+    #[cfg(feature = "server")]
+    pub(crate) fn text(&self) -> Option<&str> {
+        match self {
+            Self::InputText { text } | Self::OutputText { text } => Some(text),
+            Self::Refusal { refusal } => Some(refusal),
+            _ => None,
+        }
+    }
 }
 
 /// Reasoning configuration for the Responses API
@@ -228,6 +299,7 @@ pub enum ResponsesTool {
         parameters: Option<serde_json::Value>,
     },
     /// Web search tool
+    #[serde(alias = "web_search_preview")]
     WebSearch {},
     /// File search tool
     FileSearch {},
@@ -457,7 +529,7 @@ pub struct ResponsesUsage {
     pub total_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens_details: Option<OutputTokensDetails>,
-    /// Breakdown of input tokens (`cached_tokens` from prompt caching).
+    /// Breakdown of input tokens retrieved from or written to the cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens_details: Option<ResponsesInputTokensDetails>,
 }
@@ -466,6 +538,8 @@ pub struct ResponsesUsage {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ResponsesInputTokensDetails {
     pub cached_tokens: u32,
+    #[serde(default)]
+    pub cache_write_tokens: u32,
 }
 
 /// Details about output token usage

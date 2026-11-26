@@ -2,7 +2,7 @@
 // Implements token-by-token streaming with realistic latency simulation.
 
 use crate::ids::{prefixed_id, unix_timestamp};
-use crate::latency::LatencyProfile;
+use crate::latency::{pace_chunk, LatencyProfile, StreamPacer};
 use crate::openai::{ChatCompletionChunk, Role, Usage};
 use async_stream::stream;
 use futures_core::Stream;
@@ -27,6 +27,7 @@ pub struct TokenStream {
     /// Token usage (included in final chunk if stream_options.include_usage is true)
     usage: Option<Usage>,
     /// Callback to invoke when stream completes
+    output_pacer: Option<StreamPacer>,
     on_complete: Option<OnCompleteCallback>,
 }
 
@@ -39,6 +40,7 @@ impl TokenStream {
             latency,
             content,
             usage: None,
+            output_pacer: None,
             on_complete: None,
         }
     }
@@ -83,6 +85,12 @@ impl TokenStream {
         tokens
     }
 
+    #[cfg(feature = "server")]
+    pub(crate) fn with_output_pacer(mut self, pacer: Option<StreamPacer>) -> Self {
+        self.output_pacer = pacer;
+        self
+    }
+
     /// Create a streaming response as Server-Sent Events
     pub fn into_stream(self) -> Pin<Box<dyn Stream<Item = String> + Send>> {
         let tokens = self.tokenize();
@@ -92,6 +100,9 @@ impl TokenStream {
         let latency = self.latency.clone();
         let usage = self.usage.clone();
         let on_complete = self.on_complete;
+
+        let mut output_pacer = self.output_pacer;
+        let chunks = tokens.len();
 
         Box::pin(stream! {
             // Initial delay (time to first token)
@@ -108,14 +119,14 @@ impl TokenStream {
             // Content chunks
             for token in tokens {
                 // Inter-token delay
-                let tbt = latency.sample_tbt();
-                if !tbt.is_zero() {
-                    sleep(tbt).await;
-                }
+                pace_chunk(&mut output_pacer, chunks, || latency.sample_tbt()).await;
 
                 let content_chunk = ChatCompletionChunk::new(id.clone(), model.clone(), created)
                     .with_content(token);
                 yield format_sse(&content_chunk);
+            }
+            if let Some(pacer) = output_pacer {
+                pacer.finish();
             }
 
             // Final chunk with finish_reason

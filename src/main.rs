@@ -93,6 +93,10 @@ fn build_config(
     Ok(config)
 }
 
+fn log_filter(value: Option<&str>) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::new(value.unwrap_or("error,llmsim=info,tower_http=debug"))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -142,11 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 // Initialize tracing for server-only mode
                 tracing_subscriber::fmt()
-                    .with_env_filter(
-                        tracing_subscriber::EnvFilter::from_default_env()
-                            .add_directive("llmsim=info".parse().unwrap())
-                            .add_directive("tower_http=debug".parse().unwrap()),
-                    )
+                    .with_env_filter(log_filter(std::env::var("RUST_LOG").ok().as_deref()))
                     .init();
 
                 llmsim::cli::run_server(config).await?;
@@ -160,6 +160,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_log_overrides_server_defaults() {
+        assert_eq!(log_filter(Some("off")).to_string(), "off");
+        assert_eq!(log_filter(Some("llmsim=warn")).to_string(), "llmsim=warn");
+        assert!(log_filter(None).to_string().contains("tower_http=debug"));
+        assert!(log_filter(None).to_string().contains("llmsim=info"));
+    }
     use std::io::Write;
 
     fn write_temp_config(contents: &str, tag: &str) -> String {

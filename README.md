@@ -304,6 +304,9 @@ with TypeSafeClient(base_url="http://localhost:8080/typesafe", api_key="not-need
 
 ## Configuration
 
+For inline tool-call shapes, per-model pacing, byte token estimates, and
+seeded SDK retries, see [multi-turn load tests](docs/load-test-profiles.md).
+
 ### TOML Config File
 
 ```toml

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Inline turn shapes for stateless multi-turn tool playback on Responses, Anthropic Messages, and Chat Completions.
+- Optional per-model output profiles and achieved streaming rates, byte-based prompt estimates, and seeded SDK retry faults.
+
+### Fixed
+
+- Responses accepts replayed assistant output parts and tool-result content lists.
+- Responses and Anthropic report cache details and completed output usage during playback.
+- Server logging honors `RUST_LOG`.
+
 ## [0.9.0] - 2026-11-17
 
 ### Added

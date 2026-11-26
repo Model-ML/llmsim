@@ -26,6 +26,9 @@ that start later than short ones. Profiles live in
 values when configured; otherwise the profile matching its model id
 (`LatencyProfile::from_model`).
 
+The three HTTP text-generation endpoints can opt into glob-matched model
+profiles with measured output pacing. See [Load Profiles](load-test-profiles.md).
+
 **R1.2**: GPT-5.6+ and GPT-6 tiers have their own profiles, matched by the
 tier word in the id: `luna`, `terra`, `astra`, and `sol` (bare `gpt-5.6`,
 `gpt-6.x` ids are Sol aliases). `muse-spark-*` has its own profile.

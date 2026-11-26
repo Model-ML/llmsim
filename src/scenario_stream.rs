@@ -11,7 +11,7 @@
 // deltas, ahead of the answer.
 
 use crate::ids::{prefixed_id, unix_timestamp};
-use crate::latency::LatencyProfile;
+use crate::latency::{pace_chunk, LatencyProfile, StreamPacer};
 use crate::openai::{ChatCompletionChunk, Usage};
 use crate::scenario::ResolvedTiming;
 use crate::script::SimToolCall;
@@ -82,6 +82,31 @@ impl Pacing {
         }
         d
     }
+
+    async fn wait_token(&self, pacer: &mut Option<StreamPacer>, chunks: usize, emitted: usize) {
+        self.wait_profiled_token(pacer.as_mut(), chunks, emitted)
+            .await;
+    }
+
+    async fn wait_profiled_token(
+        &self,
+        pacer: Option<&mut StreamPacer>,
+        chunks: usize,
+        emitted: usize,
+    ) {
+        let delay = if let Some(pacer) = pacer {
+            pacer.wait(1.0 / chunks as f64).await;
+            self.timing
+                .stall
+                .filter(|stall| emitted > 0 && emitted == stall.after_tokens)
+                .map_or(Duration::ZERO, |stall| stall.duration)
+        } else {
+            self.before_token(emitted)
+        };
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+    }
 }
 
 /// Split text into word tokens with the leading whitespace attached.
@@ -116,6 +141,7 @@ pub struct ScenarioChatStream {
     usage: Option<Usage>,
     on_complete: Option<Callback>,
     on_cut: Option<Callback>,
+    output_pacer: Option<StreamPacer>,
 }
 
 impl ScenarioChatStream {
@@ -135,6 +161,7 @@ impl ScenarioChatStream {
             usage: None,
             on_complete: None,
             on_cut: None,
+            output_pacer: None,
         }
     }
 
@@ -151,6 +178,12 @@ impl ScenarioChatStream {
 
     pub fn with_usage(mut self, usage: Usage) -> Self {
         self.usage = Some(usage);
+        self
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn with_output_pacer(mut self, pacer: Option<StreamPacer>) -> Self {
+        self.output_pacer = pacer;
         self
     }
 
@@ -180,6 +213,8 @@ impl ScenarioChatStream {
         let usage = self.usage;
         let on_complete = self.on_complete;
         let on_cut = self.on_cut;
+        let mut output_pacer = self.output_pacer;
+        let chunks = reasoning.len() + text.len() + tool_calls.len();
 
         Box::pin(stream! {
             let ttft = pacing.ttft();
@@ -198,10 +233,7 @@ impl ScenarioChatStream {
                 if cut == Some(emitted) {
                     break;
                 }
-                let delay = pacing.before_token(emitted);
-                if !delay.is_zero() {
-                    sleep(delay).await;
-                }
+                pacing.wait_token(&mut output_pacer, chunks, emitted).await;
                 let frame = if is_reasoning {
                     reasoning_frame(&id, &model, created, &token)
                 } else {
@@ -227,16 +259,16 @@ impl ScenarioChatStream {
             }
 
             for (index, call) in tool_calls.iter().enumerate() {
-                let delay = pacing.inter_token();
-                if !delay.is_zero() {
-                    sleep(delay).await;
-                }
+                pace_chunk(&mut output_pacer, chunks, || pacing.inter_token()).await;
                 let (announce, args) = tool_call_chunks(&id, &model, created, index, call);
                 yield Ok(format_sse(&announce));
                 yield Ok(format_sse(&args));
             }
 
             let finish_reason = if tool_calls.is_empty() { "stop" } else { "tool_calls" };
+            if let Some(pacer) = output_pacer {
+                pacer.finish();
+            }
             let mut finish = ChatCompletionChunk::new(id.clone(), model.clone(), created)
                 .with_finish(finish_reason.to_string());
             if let Some(u) = usage {
@@ -267,13 +299,33 @@ pub trait StepFrames: Send + 'static {
 /// step's gaps and stall, an optional cut (the body aborts before `close`),
 /// then the closing frames.
 pub fn paced_frames<F: StepFrames>(
-    mut frames: F,
+    frames: F,
     reasoning: Option<&str>,
     text: &str,
     pacing: Pacing,
     cut: Option<usize>,
     on_complete: Option<Callback>,
     on_cut: Option<Callback>,
+) -> StreamItemStream {
+    profiled_frames(
+        frames,
+        reasoning,
+        text,
+        pacing,
+        cut,
+        (on_complete, on_cut),
+        None,
+    )
+}
+
+pub(crate) fn profiled_frames<F: StepFrames>(
+    mut frames: F,
+    reasoning: Option<&str>,
+    text: &str,
+    pacing: Pacing,
+    cut: Option<usize>,
+    (on_complete, on_cut): (Option<Callback>, Option<Callback>),
+    mut rate: Option<(StreamPacer, usize)>,
 ) -> StreamItemStream {
     let tokens: Vec<(bool, String)> = reasoning
         .map(word_tokens)
@@ -283,6 +335,7 @@ pub fn paced_frames<F: StepFrames>(
         .chain(word_tokens(text).into_iter().map(|t| (false, t)))
         .collect();
     Box::pin(stream! {
+        let slots = tokens.len() + rate.as_ref().map_or(0, |(_, tool_tokens)| *tool_tokens);
         let ttft = pacing.ttft();
         if !ttft.is_zero() {
             sleep(ttft).await;
@@ -295,10 +348,7 @@ pub fn paced_frames<F: StepFrames>(
             if cut == Some(emitted) {
                 break;
             }
-            let delay = pacing.before_token(emitted);
-            if !delay.is_zero() {
-                sleep(delay).await;
-            }
+            pacing.wait_profiled_token(rate.as_mut().map(|(pacer, _)| pacer), slots, emitted).await;
             for f in frames.token(is_reasoning, &token) {
                 yield Ok(f);
             }
@@ -315,9 +365,16 @@ pub fn paced_frames<F: StepFrames>(
                 return;
             }
         }
-        let delay = pacing.inter_token();
-        if !delay.is_zero() {
-            sleep(delay).await;
+        if let Some((mut pacer, tool_tokens)) = rate {
+            if tool_tokens > 0 {
+                pacer.wait(tool_tokens as f64 / slots as f64).await;
+            }
+            pacer.finish();
+        } else {
+            let delay = pacing.inter_token();
+            if !delay.is_zero() {
+                sleep(delay).await;
+            }
         }
         for f in frames.close() {
             yield Ok(f);

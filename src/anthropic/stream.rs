@@ -19,7 +19,7 @@
 
 use super::types::Usage;
 use crate::ids::prefixed_compact_id;
-use crate::latency::LatencyProfile;
+use crate::latency::{pace_chunk, LatencyProfile, StreamPacer};
 use async_stream::stream;
 use futures_core::Stream;
 use serde_json::json;
@@ -46,6 +46,7 @@ pub struct MessagesTokenStream {
     redacted_thinking: Option<String>,
     /// Total time the thinking block takes, however much of it is visible.
     thinking_time: std::time::Duration,
+    output_pacer: Option<StreamPacer>,
     on_complete: Option<OnCompleteCallback>,
 }
 
@@ -80,6 +81,7 @@ impl MessagesTokenStream {
             tool_uses: Vec::new(),
             redacted_thinking: None,
             thinking_time: std::time::Duration::ZERO,
+            output_pacer: None,
             on_complete: None,
         }
     }
@@ -132,6 +134,12 @@ impl MessagesTokenStream {
         tokenize_words(&self.content)
     }
 
+    #[cfg(feature = "server")]
+    pub(crate) fn with_output_pacer(mut self, pacer: Option<StreamPacer>) -> Self {
+        self.output_pacer = pacer;
+        self
+    }
+
     /// Render the Anthropic streaming event sequence as SSE.
     pub fn into_stream(self) -> Pin<Box<dyn Stream<Item = String> + Send>> {
         let tokens = self.tokenize();
@@ -151,6 +159,20 @@ impl MessagesTokenStream {
         let tool_uses = self.tool_uses;
         let skip_text = self.content.is_empty() && !tool_uses.is_empty();
         let on_complete = self.on_complete;
+
+        let mut output_pacer = self.output_pacer;
+        let tool_uses = tool_uses
+            .into_iter()
+            .map(|(id, name, input)| {
+                let text = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
+                (id, name, json_chunks(&text))
+            })
+            .collect::<Vec<_>>();
+        let chunks = tokens.len()
+            + tool_uses
+                .iter()
+                .map(|(_, _, args)| args.len())
+                .sum::<usize>();
 
         Box::pin(stream! {
             // Time to first token.
@@ -251,10 +273,7 @@ impl MessagesTokenStream {
 
                 // 4. content_block_delta for each token.
                 for token in tokens {
-                    let tbt = latency.sample_tbt();
-                    if !tbt.is_zero() {
-                        sleep(tbt).await;
-                    }
+                    pace_chunk(&mut output_pacer, chunks, || latency.sample_tbt()).await;
                     let delta = json!({
                         "type": "content_block_delta",
                         "index": text_index,
@@ -273,7 +292,7 @@ impl MessagesTokenStream {
 
             // 5b. tool_use blocks, input streamed as input_json_delta.
             let has_tool_uses = !tool_uses.is_empty();
-            for (id, name, input) in tool_uses {
+            for (id, name, args) in tool_uses {
                 let index = next_index;
                 next_index += 1;
                 let block_start = json!({
@@ -282,12 +301,8 @@ impl MessagesTokenStream {
                     "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
                 });
                 yield format_event("content_block_start", &block_start);
-                let text = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
-                for chunk in json_chunks(&text) {
-                    let tbt = latency.sample_tbt();
-                    if !tbt.is_zero() {
-                        sleep(tbt).await;
-                    }
+                for chunk in args {
+                    pace_chunk(&mut output_pacer, chunks, || latency.sample_tbt()).await;
                     let delta = json!({
                         "type": "content_block_delta",
                         "index": index,
@@ -299,6 +314,9 @@ impl MessagesTokenStream {
                     "content_block_stop",
                     &json!({"type": "content_block_stop", "index": index}),
                 );
+            }
+            if let Some(pacer) = output_pacer {
+                pacer.finish();
             }
 
             // 6. message_delta with final stop_reason + cumulative output usage.

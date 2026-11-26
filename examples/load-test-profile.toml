@@ -1,0 +1,22 @@
+token_estimate = "bytes"
+
+[latency]
+prefill_us_per_token = 0
+
+[response]
+# Replace these with inert functions that your client offers.
+shape_tool_allowlist = ["search", "lookup"]
+
+[errors]
+seed = 42
+rate_limit_rate = 0.01
+
+[model_profiles."gpt-*"]
+ttft_ms = { median = 850, p99 = 2200 }
+tokens_per_second = 60
+output_tokens = [180, 340]
+
+[model_profiles."claude-*"]
+ttft_ms = [650, 1100]
+tokens_per_second = 80
+output_tokens = [180, 340]
