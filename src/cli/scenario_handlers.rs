@@ -344,14 +344,22 @@ async fn deliver<F: StepFrames>(
     frames: F,
     input_tokens: u32,
     request_start: Instant,
+    inline: bool,
     body: impl FnOnce(Play) -> Response,
 ) -> Response {
     let output_tokens = play.output_tokens() as u32;
+    let shape_calls = inline.then_some(play.calls.len());
     if stream {
         let stats = state.stats.clone();
         let cut_stats = state.stats.clone();
+        let inline_state = inline.then(|| state.clone());
         let on_complete: Callback = Box::new(move || {
             stats.record_request_end(request_start.elapsed(), input_tokens, output_tokens);
+            if let (Some(state), Some(calls)) = (inline_state, shape_calls) {
+                state
+                    .load_stats
+                    .record_shape_output(calls, output_tokens as usize);
+            }
         });
         let on_cut: Callback = Box::new(move || cut_stats.record_error(0));
         return sse(profiled_frames(
@@ -374,6 +382,11 @@ async fn deliver<F: StepFrames>(
     state
         .stats
         .record_request_end(request_start.elapsed(), input_tokens, output_tokens);
+    if let Some(calls) = shape_calls {
+        state
+            .load_stats
+            .record_shape_output(calls, output_tokens as usize);
+    }
     body(play)
 }
 
@@ -424,6 +437,19 @@ pub(super) fn resolve_http(
         state.stats.record_error(error.status_code());
         error.to_sim_error()
     })? {
+        state
+            .load_stats
+            .shape_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if matches!(&resolution.turn, SimTurn::ToolCalls { calls }
+            if calls.first().is_some_and(|call| call.id.as_deref()
+                .is_some_and(|id| id.starts_with("call_replay_activate_"))))
+        {
+            state
+                .load_stats
+                .shape_activation_requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         return Ok(Some(SelectedStep {
             resolution,
             inline: true,
@@ -507,6 +533,7 @@ pub(super) async fn responses(
         frames,
         input_tokens as u32,
         request_start,
+        inline,
         move |play| {
             let output =
                 responses_output(play.reasoning.as_deref(), play.text.as_deref(), &play.calls);
@@ -583,6 +610,7 @@ pub(super) async fn anthropic(
         frames,
         input_tokens as u32,
         request_start,
+        inline,
         move |play| {
             let content = anthropic_content(
                 play.reasoning.as_deref(),
@@ -784,6 +812,7 @@ pub(super) async fn gemini(
         frames,
         req.input_tokens as u32,
         request_start,
+        false,
         move |play| {
             let mut parts = Vec::new();
             if let (Some(r), true) = (&play.reasoning, include_thoughts) {

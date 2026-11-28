@@ -449,3 +449,89 @@ generator = "fixed:Done"
     assert_eq!(second["cached_tokens"], first["cache_write_tokens"]);
     assert_eq!(second["cache_write_tokens"], 0);
 }
+
+#[tokio::test]
+async fn named_replay_uses_latest_turn_and_shapes_output_with_tools() {
+    let server = router(config(
+        "[response]\nshape_tool_allowlist = [\"web_search\", \"url_scraper\"]",
+    ));
+    let mut input = vec![
+        json!({"role": "user", "content": "[[llmsim:s=v2,o7 seed=2]]"}),
+        json!({"role": "assistant", "content": "Previous answer"}),
+        json!({"role": "user", "content": "[[llmsim:s=v2,tw1+u1@120,o40 seed=3]]"}),
+    ];
+    for step in 0..2 {
+        let mut req = responses_request(&input);
+        req["tools"] = json!([
+            {"type": "function", "name": "web_search"},
+            {"type": "function", "name": "url_scraper"}
+        ]);
+        let (headers, wire) = post(&server, RESPONSES, 0, &req).await;
+        assert_eq!(headers["x-llmsim-step"].to_str().unwrap(), step.to_string());
+        let items = events(&wire);
+        let result = completed(&items);
+        let output = result["output"].as_array().unwrap();
+        let expected_tokens = if step == 0 { 120 } else { 40 };
+        assert_eq!(result["usage"]["output_tokens"], expected_tokens);
+        let names: Vec<_> = output
+            .iter()
+            .filter_map(|item| item["name"].as_str())
+            .collect();
+        if step == 0 {
+            assert_eq!(names, ["web_search", "url_scraper"]);
+            for item in output.iter().filter(|item| item["type"] == "function_call") {
+                input.push(json!({"type": "function_call", "name": item["name"],
+                    "call_id": item["call_id"], "arguments": item["arguments"]}));
+            }
+            for item in output.iter().filter(|item| item["type"] == "function_call") {
+                input.push(json!({"type": "function_call_output",
+                    "call_id": item["call_id"], "output": "Synthetic result"}));
+            }
+        } else {
+            assert!(names.is_empty());
+        }
+    }
+    let (_, _, stats) = request(&server, "/llmsim/stats", 0, None).await;
+    let stats: Value = serde_json::from_str(&stats).unwrap();
+    assert_eq!(stats["shape_requests"], 2);
+    assert_eq!(stats["shape_tool_calls"], 2);
+    assert_eq!(stats["shape_output_tokens"], 160);
+    assert_eq!(stats["shape_tool_substitutions"], 0);
+}
+
+#[tokio::test]
+async fn named_replay_loads_deferred_toolkit_without_consuming_scripted_round() {
+    let server = router(config(
+        "[response]\nshape_tool_allowlist = [\"exec_command\"]",
+    ));
+    let mut input = vec![json!({
+        "role": "user", "content": "[[llmsim:s=v2,te1@100,o20 seed=22]]"
+    })];
+    let mut req = responses_request(&input);
+    req["tools"] = json!([{"type": "function", "name": "activate_toolkit"}]);
+    let (headers, wire) = post(&server, RESPONSES, 0, &req).await;
+    assert_eq!(headers["x-llmsim-step"], "0");
+    let items = events(&wire);
+    let activation = &completed(&items)["output"][0];
+    assert_eq!(activation["name"], "activate_toolkit");
+    assert_eq!(
+        activation["arguments"],
+        r#"{"toolkit_name":"code_execution"}"#
+    );
+    input.push(json!({"type": "function_call", "name": activation["name"],
+        "arguments": activation["arguments"], "call_id": activation["call_id"]}));
+    input.push(json!({"type": "function_call_output",
+        "output": "Toolkit loaded", "call_id": activation["call_id"]}));
+    let mut req = responses_request(&input);
+    req["tools"] = json!([{"type": "function", "name": "exec_command"}]);
+    let (headers, wire) = post(&server, RESPONSES, 0, &req).await;
+    assert_eq!(headers["x-llmsim-step"], "0");
+    let items = events(&wire);
+    let output = completed(&items)["output"].as_array().unwrap();
+    assert!(output.iter().any(|item| item["name"] == "exec_command"));
+    let (_, _, stats) = request(&server, "/llmsim/stats", 0, None).await;
+    let stats: Value = serde_json::from_str(&stats).unwrap();
+    assert_eq!(stats["shape_requests"], 2);
+    assert_eq!(stats["shape_activation_requests"], 1);
+    assert_eq!(stats["shape_tool_substitutions"], 0);
+}

@@ -855,6 +855,10 @@ pub async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     struct Snapshot {
         #[serde(flatten)]
         base: crate::stats::StatsSnapshot,
+        shape_requests: u64,
+        shape_activation_requests: u64,
+        shape_tool_calls: u64,
+        shape_output_tokens: u64,
         shape_tool_substitutions: u64,
         model_output_rates: std::collections::HashMap<String, super::load_profile::ModelRate>,
     }
@@ -864,6 +868,22 @@ pub async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         .rates(&state.config, base.model_requests.keys().cloned());
     Json(Snapshot {
         base,
+        shape_requests: state
+            .load_stats
+            .shape_requests
+            .load(std::sync::atomic::Ordering::Relaxed),
+        shape_activation_requests: state
+            .load_stats
+            .shape_activation_requests
+            .load(std::sync::atomic::Ordering::Relaxed),
+        shape_tool_calls: state
+            .load_stats
+            .shape_tool_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        shape_output_tokens: state
+            .load_stats
+            .shape_output_tokens
+            .load(std::sync::atomic::Ordering::Relaxed),
         shape_tool_substitutions: state
             .load_stats
             .shape_tool_substitutions

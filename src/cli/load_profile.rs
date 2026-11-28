@@ -272,6 +272,10 @@ impl Attempt {
 
 #[derive(Default)]
 pub(super) struct LoadStats {
+    pub(super) shape_requests: AtomicU64,
+    pub(super) shape_activation_requests: AtomicU64,
+    pub(super) shape_tool_calls: AtomicU64,
+    pub(super) shape_output_tokens: AtomicU64,
     pub(super) shape_tool_substitutions: AtomicU64,
     rates: Mutex<HashMap<String, RateSample>>,
 }
@@ -325,6 +329,13 @@ impl LoadStats {
                 Some((model, rate))
             })
             .collect()
+    }
+
+    pub(super) fn record_shape_output(&self, calls: usize, tokens: usize) {
+        self.shape_tool_calls
+            .fetch_add(calls as u64, Ordering::Relaxed);
+        self.shape_output_tokens
+            .fetch_add(tokens as u64, Ordering::Relaxed);
     }
 
     pub(super) fn substituted(&self) {

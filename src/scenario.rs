@@ -870,15 +870,21 @@ pub(crate) fn resolve_turn_shape(
     output_cap: Option<u32>,
     fallback_tokens: usize,
 ) -> Result<Option<(Resolution, bool)>, ResolveError> {
-    let Some(first_user) = messages.iter().position(|m| m.role == MessageRole::User) else {
+    let Some(user) = messages
+        .iter()
+        .rposition(|m| m.role == MessageRole::User && m.text.contains("[[llmsim:s=v2,"))
+        .or_else(|| messages.iter().position(|m| m.role == MessageRole::User))
+    else {
         return Ok(None);
     };
-    let text = &messages[first_user].text;
+    let text = &messages[user].text;
     if !text.contains("[[llmsim:s=") {
         return Ok(None);
     }
     let (payload, seed) = turn_shape_payload(text).ok_or(ResolveError::InvalidTurnShape)?;
     let shape = payload.split_once(" seed=").unwrap().0;
+    let named = shape.starts_with("v2,");
+    let shape = shape.strip_prefix("v2,").unwrap_or(shape);
     // Read one extra item so an oversized shape is rejected without
     // allocating a vector sized to the incoming prompt.
     let mut steps = shape.split(',').take(130).collect::<Vec<_>>();
@@ -893,17 +899,63 @@ pub(crate) fn resolve_turn_shape(
     if steps.len() > 128 {
         return Err(ResolveError::InvalidTurnShape);
     }
-    let calls = steps
+    let rounds = steps
         .into_iter()
-        .map(|s| count(s, 't', 128))
+        .map(|s| {
+            if named {
+                let (names, tokens) = s.split_once('@').ok_or(ResolveError::InvalidTurnShape)?;
+                let tokens = tokens
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&n| n <= 32_768 && tokens.bytes().all(|b| b.is_ascii_digit()))
+                    .ok_or(ResolveError::InvalidTurnShape)?;
+                let names = names
+                    .strip_prefix('t')
+                    .ok_or(ResolveError::InvalidTurnShape)?;
+                let mut named_calls = Vec::new();
+                for part in names.split('+') {
+                    let name = match part.as_bytes().first() {
+                        Some(b'e') => "exec_command",
+                        Some(b'n') => "news_search",
+                        Some(b'u') => "url_scraper",
+                        Some(b'w') => "web_search",
+                        _ => return Err(ResolveError::InvalidTurnShape),
+                    };
+                    if named_calls.iter().any(|(existing, _)| *existing == name) {
+                        return Err(ResolveError::InvalidTurnShape);
+                    }
+                    let n = count(part, part.as_bytes()[0] as char, 128)?;
+                    named_calls.push((name, n));
+                }
+                let n: usize = named_calls.iter().map(|(_, n)| n).sum();
+                if n > 128 {
+                    return Err(ResolveError::InvalidTurnShape);
+                }
+                Ok((n, named_calls, tokens))
+            } else {
+                Ok((count(s, 't', 128)?, Vec::new(), 0))
+            }
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    let step = tool_rounds(&messages[first_user + 1..]);
+    let history = &messages[user + 1..];
+    let is_activation = |id: &str| id.starts_with("call_replay_activate_");
+    let step = if named {
+        history
+            .iter()
+            .filter(|message| {
+                message.role == MessageRole::Assistant
+                    && message.tool_call_ids.iter().any(|id| !is_activation(id))
+            })
+            .count()
+    } else {
+        tool_rounds(history)
+    };
     let session = turn_shape_session(payload, seed);
     let fingerprint = hash_parts(&[&session.to_le_bytes(), &(step as u64).to_le_bytes()]);
     let mut rng = SplitMix64::new(fingerprint);
     let cap = output_cap.map_or(32_768, |cap| cap as usize);
     let mut substituted = false;
-    let turn = if let Some(&n) = calls.get(step) {
+    let turn = if let Some((n, named_calls, tokens)) = rounds.get(step) {
         let mut candidates = tools
             .iter()
             .filter(|tool| {
@@ -912,36 +964,96 @@ pub(crate) fn resolve_turn_shape(
             .collect::<Vec<_>>();
         candidates.sort_by(|a, b| a.name.cmp(&b.name));
         candidates.dedup_by(|a, b| a.name == b.name);
-        if candidates.is_empty() {
-            substituted = true;
-            SimTurn::Assistant {
-                text: shape_text(fallback_tokens.clamp(1, 32_768).min(cap), &mut rng),
-            }
-        } else {
+        let selected = if named_calls.is_empty() {
             // Shuffle once, then cycle when more calls than distinct tools are requested.
             for i in (1..candidates.len()).rev() {
                 let j = rng.below(i as u64 + 1) as usize;
                 candidates.swap(i, j);
             }
-            let calls = candidates
+            candidates
                 .iter()
                 .cycle()
-                .take(n)
+                .take(*n)
+                .copied()
+                .collect::<Vec<_>>()
+        } else {
+            named_calls
+                .iter()
+                .flat_map(|(name, count)| {
+                    let tool = candidates.iter().find(|tool| tool.name == *name).copied();
+                    std::iter::repeat_n(tool, *count).flatten()
+                })
+                .collect()
+        };
+        let activation = named_calls
+            .iter()
+            .filter(|(name, _)| allowlist.iter().any(|allowed| allowed == name))
+            .filter(|(name, _)| !candidates.iter().any(|tool| tool.name == *name))
+            .filter_map(|(name, _)| match *name {
+                "exec_command" => Some("code_execution"),
+                "url_scraper" => Some("url_scraper"),
+                _ => None,
+            })
+            .map(|toolkit| {
+                (
+                    toolkit,
+                    format!("call_replay_activate_{session:016x}_{toolkit}"),
+                )
+            })
+            .find(|(_, id)| !history.iter().any(|m| m.tool_call_ids.contains(id)));
+        if let Some((toolkit, id)) =
+            activation.filter(|_| tools.iter().any(|tool| tool.name == "activate_toolkit"))
+        {
+            SimTurn::ToolCalls {
+                calls: vec![SimToolCall {
+                    name: "activate_toolkit".into(),
+                    arguments: serde_json::json!({"toolkit_name": toolkit}),
+                    id: Some(id),
+                }],
+            }
+        } else if selected.is_empty() {
+            substituted = true;
+            SimTurn::Assistant {
+                text: shape_text(fallback_tokens.clamp(1, 32_768).min(cap), &mut rng),
+            }
+        } else {
+            substituted = selected.len() != *n;
+            let calls = selected
+                .into_iter()
                 .enumerate()
                 .map(|(i, tool)| {
                     let seed = rng.next_u64();
                     SimToolCall {
                         name: tool.name.clone(),
-                        arguments: tool
-                            .parameters
-                            .as_ref()
-                            .map(|schema| crate::schema_fake::fake_from_schema(schema, seed))
-                            .unwrap_or_else(|| serde_json::json!({})),
+                        arguments: if named_calls.is_empty() {
+                            tool.parameters
+                                .as_ref()
+                                .map(|schema| crate::schema_fake::fake_from_schema(schema, seed))
+                                .unwrap_or_else(|| serde_json::json!({}))
+                        } else {
+                            replay_tool_arguments(tool, seed)
+                        },
                         id: Some(format!("call_{fingerprint:016x}_{i}")),
                     }
                 })
-                .collect();
-            SimTurn::ToolCalls { calls }
+                .collect::<Vec<_>>();
+            let argument_tokens: usize = calls
+                .iter()
+                .map(|call| {
+                    let args = call.arguments.to_string();
+                    crate::count_tokens_default(&args).unwrap_or(args.split_whitespace().count())
+                        + 1
+                })
+                .sum();
+            let text_tokens = (*tokens).min(cap).saturating_sub(argument_tokens);
+            if text_tokens > 0 {
+                SimTurn::Mixed {
+                    text: shape_text(text_tokens, &mut rng),
+                    calls,
+                }
+            } else {
+                SimTurn::ToolCalls { calls }
+            }
         }
     } else {
         SimTurn::Assistant {
@@ -952,7 +1064,7 @@ pub(crate) fn resolve_turn_shape(
         Resolution {
             scenario: "turn-shape".into(),
             step,
-            step_index: step.min(calls.len()),
+            step_index: step.min(rounds.len()),
             turn,
             reasoning: None,
             timing: ResolvedTiming {
@@ -969,6 +1081,31 @@ pub(crate) fn resolve_turn_shape(
         },
         substituted,
     )))
+}
+
+#[cfg(feature = "server")]
+fn replay_tool_arguments(tool: &ToolSpec, seed: u64) -> serde_json::Value {
+    use serde_json::json;
+    let key = format!("{seed:016x}");
+    let query = format!("synthetic transit operating update {key}");
+    match tool.name.as_str() {
+        "web_search" => json!({"objective": query, "search_queries": [query]}),
+        "news_search" => {
+            let parallel = tool
+                .parameters
+                .as_ref()
+                .and_then(|schema| schema.pointer("/properties/search_queries"))
+                .is_some();
+            if parallel {
+                json!({"objective": query, "search_queries": [query], "cutoff_date": "2026-11-01T00:00:00Z"})
+            } else {
+                json!({"query": query, "cutoff_date": "2026-11-01T00:00:00Z"})
+            }
+        }
+        "url_scraper" => json!({"url": format!("https://sources.mock.test/briefings/{key}")}),
+        "exec_command" => json!({"command": format!("echo synthetic-{key}")}),
+        _ => json!({}),
+    }
 }
 
 #[cfg(feature = "server")]
