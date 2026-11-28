@@ -12,6 +12,7 @@ use std::sync::{Arc, OnceLock};
 pub struct AppState {
     pub config: Config,
     pub stats: SharedStats,
+    pub(super) load_stats: Arc<super::load_profile::LoadStats>,
     /// Optional scripted-response source. When set, handlers replay
     /// scripted turns instead of using the configured generator.
     pub script: Option<Arc<Script>>,
@@ -48,6 +49,7 @@ impl AppState {
             prompt_cache: Arc::new(PromptCache::default()),
             config,
             stats,
+            load_stats: Arc::default(),
             script: None,
             scenarios: None,
             attempts: Arc::new(AttemptTracker::default()),
@@ -65,6 +67,7 @@ impl AppState {
                 let mut config = self.config.clone();
                 config.latency.profile = Some("instant".to_string());
                 config.latency.prefill_us_per_token = Some(0);
+                config.model_profiles.clear();
                 config.errors = Default::default();
                 config.rate_limits = Default::default();
                 config.server.call_log = false;

@@ -7,6 +7,8 @@
 // exactly what they declare; generated responses follow the model's thinking
 // defaults (see `crate::anthropic::thinking`).
 
+use super::load_profile::{Attempt, TokenEstimate};
+use super::scenario_handlers;
 use super::state::AppState;
 use crate::anthropic::{
     default_anthropic_model_ids, get_anthropic_model_profile, thinking, AnthropicErrorResponse,
@@ -15,11 +17,11 @@ use crate::anthropic::{
 };
 use crate::ids::prefixed_compact_id;
 use crate::script::{ScriptedResponse, SimError, SimToolCall, SimTurn};
-use crate::{create_generator, EndpointType, ErrorInjector};
+use crate::EndpointType;
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -51,6 +53,7 @@ pub(super) fn sim_error_to_anthropic_response(err: &SimError) -> Response {
 /// POST /anthropic/v1/messages
 pub async fn create_message(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<MessagesRequest>,
 ) -> Response {
     let request_start = Instant::now();
@@ -67,8 +70,12 @@ pub async fn create_message(
         .record_request_start(&request.model, request.stream, EndpointType::Messages);
 
     // Error injection (Anthropic error wire shape).
-    let error_injector = ErrorInjector::new(state.config.error_config());
-    if let Some(error) = error_injector.maybe_inject() {
+    let (messages, tools) = scenario_handlers::anthropic_conversation(&request);
+    let retry = Attempt::new(&state.config, &headers, &messages);
+    if let Some(response) = retry.overload(&state, super::limits::Provider::Anthropic) {
+        return response;
+    }
+    if let Some(error) = retry.injected_error(&state.config) {
         tracing::warn!("Injecting error: {:?}", error);
         let status_code = error.status_code();
         state.stats.record_error(status_code);
@@ -95,12 +102,18 @@ pub async fn create_message(
         return anthropic_error(400, message);
     }
 
+    let input_tokens = count_prompt_tokens(
+        &request.prompt_text(),
+        &request.messages,
+        request.tools.as_deref(),
+        state.config.token_estimate,
+    );
     // Reject requests over the model's context window or output cap.
     if let Err(v) = super::validation::check(
         &state.config.validation,
         &request.model,
         super::validation::anthropic_limits(&request.model),
-        count_input_tokens(&request),
+        input_tokens,
         Some(request.max_tokens),
     ) {
         let (status, message) = super::validation::anthropic_parts(&v);
@@ -108,20 +121,35 @@ pub async fn create_message(
         return anthropic_error(status, message);
     }
 
-    // Model-specific latency (unless overridden in config).
-    let latency = state.config.latency_for_model(&request.model);
-
-    // Scenario mode, as on chat completions.
-    if let Some(response) =
-        super::scenario_handlers::anthropic(&state, &request, request_start, latency.clone()).await
-    {
-        return response;
+    match scenario_handlers::resolve_http(
+        &state,
+        &messages,
+        &tools,
+        &request.model,
+        Some(request.max_tokens),
+    ) {
+        Ok(Some(step)) => {
+            return scenario_handlers::anthropic(
+                &state,
+                &request,
+                request_start,
+                step,
+                retry,
+                input_tokens,
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(error) => return sim_error_to_anthropic_response(&error),
     }
+
+    let latency = state.config.generation_latency(&request.model);
 
     // Scripted non-streaming requests get full tool-call support.
     if let Some(script) = state.script.clone() {
         if !request.stream {
-            return handle_scripted_message(state, request, request_start, script).await;
+            return handle_scripted_message(state, request, request_start, script, input_tokens)
+                .await;
         }
     }
 
@@ -179,9 +207,6 @@ pub async fn create_message(
         generate_content(&state, &request)
     };
 
-    let input_tokens = count_input_tokens(&request);
-    let (cache_read, cache_creation) = anthropic_cache(&state, &request, input_tokens);
-    let latency = latency.with_input_tokens(input_tokens - cache_read);
     let text_tokens =
         crate::count_tokens_default(&content).unwrap_or(content.split_whitespace().count());
 
@@ -211,19 +236,12 @@ pub async fn create_message(
         })
         .sum();
     let output_tokens = text_tokens + tool_tokens + thinking_plan.as_ref().map_or(0, |p| p.tokens);
-    // Anthropic bills cached and newly cached tokens apart from `input_tokens`.
-    let mut usage = Usage::new(
-        (input_tokens - cache_read - cache_creation) as u32,
-        output_tokens as u32,
-    );
-    if state.config.response.prompt_caching {
-        usage.cache_read_input_tokens = Some(cache_read as u32);
-        usage.cache_creation_input_tokens = Some(cache_creation as u32);
-    }
+    let (usage, cache_read) = message_usage(&state, &request, input_tokens, output_tokens);
+    let latency = latency.with_input_tokens(input_tokens - cache_read);
 
     if request.stream {
         let stats = state.stats.clone();
-        let input_tok = usage.input_tokens;
+        let input_tok = input_tokens as u32;
         let output_tok = usage.output_tokens;
 
         let thinking_time = std::time::Duration::from_millis(
@@ -244,7 +262,8 @@ pub async fn create_message(
             .on_complete(move || {
                 stats.record_request_end(request_start.elapsed(), input_tok, output_tok);
             })
-            .build();
+            .build()
+            .with_output_pacer(state.stream_pacer(&request.model, text_tokens + tool_tokens));
 
         let body = Body::from_stream(stream.into_stream().map(Ok::<_, std::io::Error>));
         Response::builder()
@@ -255,13 +274,15 @@ pub async fn create_message(
             .body(body)
             .unwrap()
     } else {
-        let delay = latency.sample_ttft();
+        let delay = state
+            .config
+            .response_delay(&request.model, &latency, output_tokens);
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
         state.stats.record_request_end(
             request_start.elapsed(),
-            usage.input_tokens,
+            input_tokens as u32,
             usage.output_tokens,
         );
         let mut blocks = Vec::with_capacity(2);
@@ -299,7 +320,7 @@ pub async fn create_message(
 /// Returns the `input_tokens` a Messages request with the same prompt would
 /// report, without generating anything.
 pub async fn count_tokens(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(request): Json<CountTokensRequest>,
 ) -> Response {
     if let Err(message) = thinking::validate(
@@ -310,7 +331,12 @@ pub async fn count_tokens(
     ) {
         return anthropic_error(400, message);
     }
-    let input_tokens = count_prompt_tokens(&request.prompt_text(), request.messages.len());
+    let input_tokens = count_prompt_tokens(
+        &request.prompt_text(),
+        &request.messages,
+        request.tools.as_deref(),
+        state.config.token_estimate,
+    );
     Json(CountTokensResponse {
         input_tokens: input_tokens as u32,
     })
@@ -324,6 +350,7 @@ async fn handle_scripted_message(
     request: MessagesRequest,
     request_start: Instant,
     script: Arc<crate::script::Script>,
+    input_tokens: usize,
 ) -> Response {
     let turn_index = script.cursor();
     let turn = match script.next_turn() {
@@ -347,7 +374,6 @@ async fn handle_scripted_message(
         }
     };
 
-    let input_tokens = count_input_tokens(&request);
     let text_for_usage = text.clone().unwrap_or_default();
     let mut output_tokens = crate::count_tokens_default(&text_for_usage)
         .unwrap_or(text_for_usage.split_whitespace().count());
@@ -381,10 +407,10 @@ async fn handle_scripted_message(
         content.push(ContentBlock::text(""));
     }
 
-    let usage = Usage::new(input_tokens as u32, output_tokens as u32);
+    let (usage, _) = message_usage(&state, &request, input_tokens, output_tokens);
     state.stats.record_request_end(
         request_start.elapsed(),
-        usage.input_tokens,
+        input_tokens as u32,
         usage.output_tokens,
     );
 
@@ -398,6 +424,22 @@ pub const REDACTED_THINKING_MARKER: &str = "[[llmsim:redacted-thinking]]";
 /// Opaque `redacted_thinking` data derived from the block's signature.
 fn redacted_data(signature: &str) -> String {
     format!("EmwK{}", signature.chars().rev().collect::<String>())
+}
+
+pub(super) fn message_usage(
+    state: &AppState,
+    request: &MessagesRequest,
+    input_tokens: usize,
+    output_tokens: usize,
+) -> (Usage, usize) {
+    let (read, creation) = anthropic_cache(state, request, input_tokens);
+    let usage = Usage {
+        input_tokens: (input_tokens - read - creation) as u32,
+        output_tokens: output_tokens as u32,
+        cache_read_input_tokens: Some(read as u32),
+        cache_creation_input_tokens: Some(creation as u32),
+    };
+    (usage, read)
 }
 
 /// Prompt caching for a Messages request: (cache_read, cache_creation)
@@ -415,7 +457,7 @@ fn anthropic_cache(
     let mut prefixes = super::prompt_cache::PrefixBuilder::new(&request.model);
     let mut breakpoints = Vec::new();
     let mut push = |piece: String, marked: bool| {
-        let tokens = crate::count_tokens_default(&piece).unwrap_or(piece.len() / 4);
+        let tokens = state.config.token_estimate.count(&piece);
         let p = prefixes.push(&piece, tokens);
         if marked {
             breakpoints.push(p);
@@ -469,10 +511,6 @@ fn anthropic_cache(
 /// Generate response content for non-scripted requests via the configured
 /// generator, reusing the OpenAI `ChatCompletionRequest` the generators accept.
 fn generate_content(state: &AppState, request: &MessagesRequest) -> String {
-    let generator = create_generator(
-        &state.config.response.generator,
-        state.config.response.target_tokens,
-    );
     let prompt = request.prompt_text();
     let chat_request = crate::openai::ChatCompletionRequest {
         model: request.model.clone(),
@@ -494,19 +532,35 @@ fn generate_content(state: &AppState, request: &MessagesRequest) -> String {
         seed: None,
         reasoning_effort: None,
     };
-    generator.generate(&chat_request)
+    state.config.generate_text(&chat_request, true)
 }
 
-/// Count input tokens for a Messages request (prompt text + small overhead).
-pub(super) fn count_input_tokens(request: &MessagesRequest) -> usize {
-    count_prompt_tokens(&request.prompt_text(), request.messages.len())
-}
-
-/// Token count for a flattened prompt plus per-message framing overhead.
-fn count_prompt_tokens(text: &str, message_count: usize) -> usize {
-    let base = crate::count_tokens_default(text).unwrap_or(text.split_whitespace().count());
-    // Per-message + request framing overhead, similar to the OpenAI handler.
-    base + message_count * 3 + 5
+/// Token count for a flattened prompt, tool schemas and framing overhead.
+fn count_prompt_tokens(
+    text: &str,
+    messages: &[crate::anthropic::AnthropicMessage],
+    tools: Option<&[crate::anthropic::Tool]>,
+    estimate: TokenEstimate,
+) -> usize {
+    let tool_tokens = tools.filter(|tools| !tools.is_empty()).map_or(0, |tools| {
+        estimate.count(&serde_json::to_string(tools).unwrap_or_default())
+    });
+    use crate::anthropic::{MessageContent, RequestContentBlock};
+    let call_tokens = messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            MessageContent::Blocks(blocks) => Some(blocks),
+            MessageContent::Text(_) => None,
+        })
+        .flatten()
+        .map(|block| match block {
+            RequestContentBlock::ToolUse { name, input, .. } => {
+                estimate.count(name) + estimate.count(&input.to_string())
+            }
+            _ => 0,
+        })
+        .sum::<usize>();
+    estimate.count(text) + messages.len() * 3 + 5 + tool_tokens + call_tokens
 }
 
 /// Approximate output tokens contributed by a scripted tool call.

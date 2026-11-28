@@ -192,6 +192,8 @@ async fn handle_ws_connection(mut socket: WebSocket, state: Arc<AppState>) {
                                 max_output_tokens: body.max_output_tokens,
                                 reasoning: &body.reasoning,
                                 text: &body.text,
+                                tools: body.tools.as_deref(),
+                                http: false,
                             },
                         );
 

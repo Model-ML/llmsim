@@ -113,6 +113,35 @@ pub fn count_tokens_default(text: &str) -> Result<usize, TokenError> {
     count_tokens(text, "gpt-4")
 }
 
+#[cfg(feature = "server")]
+pub(crate) fn truncate_output_tokens(text: String, limit: usize) -> String {
+    if let Ok(counter) = TokenCounter::new("gpt-4") {
+        let tokens = counter.encode(&text);
+        if tokens.len() > limit {
+            // Token boundaries can fall inside UTF-8 characters.
+            for end in (limit.saturating_sub(3)..=limit).rev() {
+                if let Ok(mut prefix) = counter.decode(&tokens[..end]) {
+                    // A partial word may tokenize differently on its own.
+                    let count = counter.count(&prefix);
+                    if count == limit {
+                        return prefix;
+                    }
+                    if count < limit {
+                        let fallback = prefix.clone();
+                        prefix.push_str(&" text".repeat(limit - count));
+                        return if counter.count(&prefix) == limit {
+                            prefix
+                        } else {
+                            fallback
+                        };
+                    }
+                }
+            }
+        }
+    }
+    text
+}
+
 /// Token counter that caches the tokenizer for repeated use
 pub struct TokenCounter {
     bpe: &'static CoreBPE,

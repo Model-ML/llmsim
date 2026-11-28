@@ -1,5 +1,9 @@
 # LLMSim Knowledge Update Log
 
+## 2026-11-26
+
+* **Stateless load profiles.** [Inline turn shapes and model profiles](simulation/load-test-profiles.md) support explicit history replay, retry-keyed faults, and per-model output pacing.
+
 ## 2026-11-20
 
 * **HTTP Responses continuation.** [Responses API](apis/responses-api.md) now stores

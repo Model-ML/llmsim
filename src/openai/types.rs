@@ -273,6 +273,8 @@ pub struct Usage {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct PromptTokensDetails {
     pub cached_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u32>,
 }
 
 /// Breakdown of completion tokens (reasoning models only).

@@ -2,7 +2,7 @@
 // Implements streaming for the OpenAI Responses API format.
 
 use crate::ids::{prefixed_id, unix_timestamp};
-use crate::latency::LatencyProfile;
+use crate::latency::{pace_chunk, LatencyProfile, StreamPacer};
 use crate::openai::{
     ItemStatus, OutputContentPart, OutputItem, OutputRole, OutputTokensDetails, ReasoningSummary,
     ResponseStatus, ResponsesResponse, ResponsesStreamEvent, ResponsesUsage,
@@ -60,6 +60,7 @@ pub struct ResponsesTokenStream {
     /// Optional reasoning summary text to stream
     reasoning_summary: Option<String>,
     /// Callback to invoke when stream completes
+    output_pacer: Option<StreamPacer>,
     on_complete: Option<OnCompleteCallback>,
     on_response_completed: Option<ResponseCompleted>,
 }
@@ -81,6 +82,7 @@ impl ResponsesTokenStream {
             usage,
             include_reasoning: false,
             reasoning_summary: None,
+            output_pacer: None,
             on_complete: None,
             on_response_completed: None,
         }
@@ -118,6 +120,12 @@ impl ResponsesTokenStream {
         tokens
     }
 
+    #[cfg(feature = "server")]
+    pub(crate) fn with_output_pacer(mut self, pacer: Option<StreamPacer>) -> Self {
+        self.output_pacer = pacer;
+        self
+    }
+
     /// Create a streaming response as Server-Sent Events
     pub fn into_stream(self) -> Pin<Box<dyn Stream<Item = String> + Send>> {
         let content_tokens = Self::tokenize_text(&self.content);
@@ -132,6 +140,9 @@ impl ResponsesTokenStream {
         let reasoning_summary = self.reasoning_summary.clone();
         let on_complete = self.on_complete;
         let on_response_completed = self.on_response_completed;
+
+        let mut output_pacer = self.output_pacer;
+        let chunks = content_tokens.len();
 
         Box::pin(stream! {
             let mut completion_guard = CompletionGuard::new(on_complete);
@@ -273,16 +284,16 @@ impl ResponsesTokenStream {
             // Stream content chunks with delta events
             for token in content_tokens.into_iter() {
                 // Inter-token delay
-                let tbt = latency.sample_tbt();
-                if !tbt.is_zero() {
-                    sleep(tbt).await;
-                }
+                pace_chunk(&mut output_pacer, chunks, || latency.sample_tbt()).await;
 
                 // response.output_text.delta event
                 yield ResponsesStreamEvent::output_text_delta(
                     message_output_index, 0, &message_id, &token, seq,
                 );
                 seq += 1;
+            }
+            if let Some(pacer) = output_pacer {
+                pacer.finish();
             }
 
             // response.output_text.done event

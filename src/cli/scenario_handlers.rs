@@ -13,12 +13,13 @@
 //   only its text blocks (if any) count as a new user message.
 
 use super::handlers::{
-    count_responses_input_image_tokens, extract_input_text, sim_error_to_responses_api_response,
+    responses_cache_usage, responses_prompt_tokens, sim_error_to_responses_api_response,
 };
+use super::load_profile::Attempt;
 use super::state::AppState;
 use crate::anthropic::{
     MessageContent as AMessageContent, MessagesRequest, RequestContentBlock, Role as ARole,
-    SystemPrompt, Usage as AUsage,
+    SystemPrompt,
 };
 use crate::openai::{
     ContentPart, InputItem, InputRole, MessageContent, OutputTokensDetails, ResponsesInput,
@@ -31,7 +32,7 @@ use crate::scenario_frames::{
     anthropic_body, anthropic_content, responses_body, responses_output, thinking_signature,
     AnthropicFrames, ResponsesFrames,
 };
-use crate::scenario_stream::{paced_frames, word_tokens, Callback, Pacing, StepFrames};
+use crate::scenario_stream::{profiled_frames, word_tokens, Callback, Pacing, StepFrames};
 use crate::script::{SimError, SimToolCall, SimTurn};
 use crate::LatencyProfile;
 use axum::{
@@ -70,10 +71,7 @@ fn responses_text(content: &MessageContent) -> String {
         MessageContent::Text(t) => t.clone(),
         MessageContent::Parts(parts) => parts
             .iter()
-            .filter_map(|p| match p {
-                ContentPart::InputText { text } => Some(text.as_str()),
-                _ => None,
-            })
+            .filter_map(ContentPart::text)
             .collect::<Vec<_>>()
             .join(" "),
     }
@@ -114,6 +112,21 @@ pub fn responses_conversation(
                         ConversationMessage::new(MessageRole::Tool, output.clone())
                             .with_tool_call_ids([call_id.clone()]),
                     ),
+                    InputItem::FunctionCallOutputParts { call_id, output } => out.push(
+                        ConversationMessage::new(
+                            MessageRole::Tool,
+                            output
+                                .iter()
+                                .filter_map(ContentPart::text)
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        )
+                        .with_tool_call_ids([call_id.clone()]),
+                    ),
+                    InputItem::WebSearchCall { .. } => {
+                        push_assistant(&mut out, String::new(), Vec::new())
+                    }
+                    InputItem::ConfigurationUpdate { .. } | InputItem::AdditionalTools { .. } => {}
                 }
             }
         }
@@ -218,6 +231,7 @@ struct Play {
     tool_tokens: usize,
     pacing: Pacing,
     cut: Option<usize>,
+    output_pacer: Option<crate::latency::StreamPacer>,
 }
 
 impl Play {
@@ -226,22 +240,21 @@ impl Play {
     }
 }
 
-/// What a resolved step does on this attempt: an error to render, or a play.
-enum Outcome {
-    Fail(StepError),
-    Play(Play),
-}
-
-fn prepare(resolution: &Resolution, attempt: u32, latency: LatencyProfile) -> Outcome {
-    let cut = match resolution.outcome(attempt) {
-        AttemptOutcome::Fail(err) => return Outcome::Fail(err),
+fn prepare(
+    resolution: &Resolution,
+    outcome: AttemptOutcome,
+    latency: LatencyProfile,
+    inline: bool,
+) -> Result<Play, StepError> {
+    let cut = match outcome {
+        AttemptOutcome::Fail(err) => return Err(err),
         AttemptOutcome::Respond { cut_after_tokens } => cut_after_tokens,
     };
     let (text, calls) = match resolution.turn.clone() {
         SimTurn::Assistant { text } => (Some(text), Vec::new()),
         SimTurn::ToolCalls { calls } => (None, calls),
         SimTurn::Mixed { text, calls } => (Some(text), calls),
-        SimTurn::Error(err) => return Outcome::Fail(StepError::from(err)),
+        SimTurn::Error(err) => return Err(StepError::from(err)),
     };
     let tool_tokens = calls
         .iter()
@@ -250,8 +263,10 @@ fn prepare(resolution: &Resolution, attempt: u32, latency: LatencyProfile) -> Ou
             crate::count_tokens_default(&args).unwrap_or(args.split_whitespace().count()) + 1
         })
         .sum();
-    Outcome::Play(Play {
-        text_tokens: text.as_deref().map_or(0, |t| word_tokens(t).len()),
+    Ok(Play {
+        text_tokens: text
+            .as_deref()
+            .map_or(0, |t| playback_text_tokens(t, inline)),
         reasoning_tokens: resolution
             .reasoning
             .as_deref()
@@ -262,7 +277,17 @@ fn prepare(resolution: &Resolution, attempt: u32, latency: LatencyProfile) -> Ou
         calls,
         pacing: Pacing::new(resolution.timing.clone(), latency),
         cut,
+        output_pacer: None,
     })
+}
+
+pub(super) fn playback_text_tokens(text: &str, inline: bool) -> usize {
+    if inline {
+        if let Ok(tokens) = crate::count_tokens_default(text) {
+            return tokens;
+        }
+    }
+    word_tokens(text).len()
 }
 
 fn trace(mut response: Response, resolution: &Resolution, attempt: u32) -> Response {
@@ -319,24 +344,32 @@ async fn deliver<F: StepFrames>(
     frames: F,
     input_tokens: u32,
     request_start: Instant,
+    inline: bool,
     body: impl FnOnce(Play) -> Response,
 ) -> Response {
     let output_tokens = play.output_tokens() as u32;
+    let shape_calls = inline.then_some(play.calls.len());
     if stream {
         let stats = state.stats.clone();
         let cut_stats = state.stats.clone();
+        let inline_state = inline.then(|| state.clone());
         let on_complete: Callback = Box::new(move || {
             stats.record_request_end(request_start.elapsed(), input_tokens, output_tokens);
+            if let (Some(state), Some(calls)) = (inline_state, shape_calls) {
+                state
+                    .load_stats
+                    .record_shape_output(calls, output_tokens as usize);
+            }
         });
         let on_cut: Callback = Box::new(move || cut_stats.record_error(0));
-        return sse(paced_frames(
+        return sse(profiled_frames(
             frames,
             play.reasoning.as_deref(),
             play.text.as_deref().unwrap_or(""),
             play.pacing.clone(),
             play.cut,
-            Some(on_complete),
-            Some(on_cut),
+            (Some(on_complete), Some(on_cut)),
+            play.output_pacer.map(|pacer| (pacer, play.tool_tokens)),
         ));
     }
     let tokens = play.text_tokens + play.reasoning_tokens;
@@ -349,6 +382,11 @@ async fn deliver<F: StepFrames>(
     state
         .stats
         .record_request_end(request_start.elapsed(), input_tokens, output_tokens);
+    if let Some(calls) = shape_calls {
+        state
+            .load_stats
+            .record_shape_output(calls, output_tokens as usize);
+    }
     body(play)
 }
 
@@ -358,50 +396,127 @@ fn resolve(
     messages: &[ConversationMessage],
     tools: &[ToolSpec],
     model: &str,
+    http_text: bool,
 ) -> Result<Option<Resolution>, SimError> {
     let Some(scenarios) = state.scenarios.as_ref() else {
         return Ok(None);
     };
-    crate::scenario::resolve(messages, tools, Some(model), scenarios).map_err(|err| {
+    let resolved = if http_text {
+        crate::scenario::resolve_http_named(messages, tools, Some(model), scenarios)
+    } else {
+        crate::scenario::resolve(messages, tools, Some(model), scenarios)
+    };
+    resolved.map_err(|err| {
         tracing::warn!(error = %err, "Scenario resolution failed");
         state.stats.record_error(err.status_code());
         err.to_sim_error()
     })
 }
 
-/// Play a scenario on the Responses API, if the request selects one.
+pub(super) struct SelectedStep {
+    pub(super) resolution: Resolution,
+    pub(super) inline: bool,
+    pub(super) substituted: bool,
+}
+
+pub(super) fn resolve_http(
+    state: &AppState,
+    messages: &[ConversationMessage],
+    tools: &[ToolSpec],
+    model: &str,
+    output_cap: Option<u32>,
+) -> Result<Option<SelectedStep>, SimError> {
+    if let Some((resolution, substituted)) = crate::scenario::resolve_turn_shape(
+        messages,
+        tools,
+        &state.config.response.shape_tool_allowlist,
+        output_cap,
+        state.config.response.target_tokens,
+    )
+    .map_err(|error| {
+        state.stats.record_error(error.status_code());
+        error.to_sim_error()
+    })? {
+        state
+            .load_stats
+            .shape_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if matches!(&resolution.turn, SimTurn::ToolCalls { calls }
+            if calls.first().is_some_and(|call| call.id.as_deref()
+                .is_some_and(|id| id.starts_with("call_replay_activate_"))))
+        {
+            state
+                .load_stats
+                .shape_activation_requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return Ok(Some(SelectedStep {
+            resolution,
+            inline: true,
+            substituted,
+        }));
+    }
+    Ok(
+        resolve(state, messages, tools, model, true)?.map(|resolution| SelectedStep {
+            resolution,
+            inline: false,
+            substituted: false,
+        }),
+    )
+}
+
+/// Play a named scenario or inline shape on the Responses API.
 pub(super) async fn responses(
     state: &Arc<AppState>,
     request: &ResponsesRequest,
     request_start: Instant,
-    latency: LatencyProfile,
-) -> Option<Response> {
-    let (messages, tools) = responses_conversation(request);
-    let resolution = match resolve(state, &messages, &tools, &request.model) {
-        Ok(Some(r)) => r,
-        Ok(None) => return None,
-        Err(e) => return Some(sim_error_to_responses_api_response(&e)),
-    };
-    let attempt = state.attempts.next_attempt(resolution.fingerprint);
-    let input_text = extract_input_text(&request.input, &request.instructions);
-    let input_tokens = crate::count_tokens_default(&input_text)
-        .unwrap_or(input_text.split_whitespace().count())
-        + count_responses_input_image_tokens(&request.input);
-    let play = match prepare(
+    step: SelectedStep,
+    retry: Attempt,
+) -> Response {
+    let SelectedStep {
+        resolution,
+        inline,
+        substituted,
+    } = step;
+    let attempt = retry.for_step(state, &resolution, inline);
+    let outcome = retry.outcome(&resolution, attempt);
+    let mut play = match prepare(
         &resolution,
-        attempt,
-        latency.with_input_tokens(input_tokens),
+        outcome,
+        state.config.generation_latency(&request.model),
+        inline,
     ) {
-        Outcome::Fail(err) => {
+        Err(err) => {
             state.stats.record_error(err.error.status_code());
             let r = with_retry(sim_error_to_responses_api_response(&err.error), &err);
-            return Some(trace(r, &resolution, attempt));
+            return trace(r, &resolution, attempt);
         }
-        Outcome::Play(p) => p,
+        Ok(play) => play,
     };
+    if substituted {
+        state.load_stats.substituted();
+    }
+    let input_tokens = responses_prompt_tokens(
+        state.config.token_estimate,
+        &request.input,
+        &request.instructions,
+        request.tools.as_deref(),
+    );
+    let cache = responses_cache_usage(
+        state,
+        &request.model,
+        &request.input,
+        &request.instructions,
+        input_tokens,
+    );
+    play.pacing.latency = play
+        .pacing
+        .latency
+        .with_input_tokens(input_tokens - cache.cached_tokens as usize);
     let output_tokens = play.output_tokens();
+    play.output_pacer = state.scenario_pacer(&request.model, output_tokens, &resolution);
     let usage = ResponsesUsage {
-        input_tokens_details: None,
+        input_tokens_details: Some(cache),
         input_tokens: input_tokens as u32,
         output_tokens: output_tokens as u32,
         total_tokens: (input_tokens + output_tokens) as u32,
@@ -418,6 +533,7 @@ pub(super) async fn responses(
         frames,
         input_tokens as u32,
         request_start,
+        inline,
         move |play| {
             let output =
                 responses_output(play.reasoning.as_deref(), play.text.as_deref(), &play.calls);
@@ -433,44 +549,52 @@ pub(super) async fn responses(
         },
     )
     .await;
-    Some(trace(response, &resolution, attempt))
+    trace(response, &resolution, attempt)
 }
 
-/// Play a scenario on Anthropic Messages, if the request selects one.
+/// Play a named scenario or inline shape on Anthropic Messages.
 pub(super) async fn anthropic(
     state: &Arc<AppState>,
     request: &MessagesRequest,
     request_start: Instant,
-    latency: LatencyProfile,
-) -> Option<Response> {
-    let (messages, tools) = anthropic_conversation(request);
-    let resolution = match resolve(state, &messages, &tools, &request.model) {
-        Ok(Some(r)) => r,
-        Ok(None) => return None,
-        Err(e) => {
-            return Some(super::anthropic_handlers::sim_error_to_anthropic_response(
-                &e,
-            ))
-        }
-    };
-    let attempt = state.attempts.next_attempt(resolution.fingerprint);
-    let input_tokens = super::anthropic_handlers::count_input_tokens(request);
-    let play = match prepare(
+    step: SelectedStep,
+    retry: Attempt,
+    input_tokens: usize,
+) -> Response {
+    let SelectedStep {
+        resolution,
+        inline,
+        substituted,
+    } = step;
+    let attempt = retry.for_step(state, &resolution, inline);
+    let outcome = retry.outcome(&resolution, attempt);
+    let mut play = match prepare(
         &resolution,
-        attempt,
-        latency.with_input_tokens(input_tokens),
+        outcome,
+        state.config.generation_latency(&request.model),
+        inline,
     ) {
-        Outcome::Fail(err) => {
+        Err(err) => {
             state.stats.record_error(err.error.status_code());
             let r = with_retry(
                 super::anthropic_handlers::sim_error_to_anthropic_response(&err.error),
                 &err,
             );
-            return Some(trace(r, &resolution, attempt));
+            return trace(r, &resolution, attempt);
         }
-        Outcome::Play(p) => p,
+        Ok(play) => play,
     };
-    let usage = AUsage::new(input_tokens as u32, play.output_tokens() as u32);
+    if substituted {
+        state.load_stats.substituted();
+    }
+    let output_tokens = play.output_tokens();
+    let (usage, cache_read) =
+        super::anthropic_handlers::message_usage(state, request, input_tokens, output_tokens);
+    play.pacing.latency = play
+        .pacing
+        .latency
+        .with_input_tokens(input_tokens - cache_read);
+    play.output_pacer = state.scenario_pacer(&request.model, output_tokens, &resolution);
     let signature = thinking_signature(&resolution.fingerprint.to_string());
     let frames = AnthropicFrames::new(
         &request.model,
@@ -486,6 +610,7 @@ pub(super) async fn anthropic(
         frames,
         input_tokens as u32,
         request_start,
+        inline,
         move |play| {
             let content = anthropic_content(
                 play.reasoning.as_deref(),
@@ -497,7 +622,7 @@ pub(super) async fn anthropic(
         },
     )
     .await;
-    Some(trace(response, &resolution, attempt))
+    trace(response, &resolution, attempt)
 }
 
 // ---------------------------------------------------------------------------
@@ -637,7 +762,7 @@ pub(super) async fn gemini(
 ) -> Option<Response> {
     use super::decisions_handlers::gemini_error;
     let (messages, tools) = gemini_conversation(req);
-    let resolution = match resolve(state, &messages, &tools, model) {
+    let resolution = match resolve(state, &messages, &tools, model, false) {
         Ok(Some(r)) => r,
         Ok(None) => return None,
         Err(e) => return Some(gemini_error(e.status_code(), e.message())),
@@ -645,10 +770,11 @@ pub(super) async fn gemini(
     let attempt = state.attempts.next_attempt(resolution.fingerprint);
     let play = match prepare(
         &resolution,
-        attempt,
+        resolution.outcome(attempt),
         latency.with_input_tokens(req.input_tokens),
+        false,
     ) {
-        Outcome::Fail(err) => {
+        Err(err) => {
             state.stats.record_error(err.error.status_code());
             let r = with_retry(
                 gemini_error(err.error.status_code(), err.error.message()),
@@ -656,7 +782,7 @@ pub(super) async fn gemini(
             );
             return Some(trace(r, &resolution, attempt));
         }
-        Outcome::Play(p) => p,
+        Ok(play) => play,
     };
     let usage = super::gemini_handlers::usage_metadata(
         req.input_tokens,
@@ -686,6 +812,7 @@ pub(super) async fn gemini(
         frames,
         req.input_tokens as u32,
         request_start,
+        false,
         move |play| {
             let mut parts = Vec::new();
             if let (Some(r), true) = (&play.reasoning, include_thoughts) {

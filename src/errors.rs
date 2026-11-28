@@ -183,7 +183,16 @@ impl ErrorInjector {
     /// Decide whether to inject an error based on configured rates
     /// Returns None if no error should be injected
     pub fn maybe_inject(&self) -> Option<SimulatedError> {
-        let mut rng = rand::rng();
+        self.inject_with_rng(&mut rand::rng())
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn inject_seeded(&self, seed: u64) -> Option<SimulatedError> {
+        use rand::SeedableRng;
+        self.inject_with_rng(&mut rand::rngs::StdRng::seed_from_u64(seed))
+    }
+
+    fn inject_with_rng(&self, rng: &mut impl rand::Rng) -> Option<SimulatedError> {
         let roll: f64 = rng.random();
 
         let mut threshold = 0.0;

@@ -5,7 +5,7 @@
 // dedicated builder so we can keep the simple path simple.
 
 use crate::ids::{prefixed_id, unix_timestamp};
-use crate::latency::LatencyProfile;
+use crate::latency::{pace_chunk, LatencyProfile, StreamPacer};
 use crate::openai::{
     ChatCompletionChunk, ChunkChoice, ChunkDelta, ChunkFunctionCall, ChunkToolCall, Role, Usage,
 };
@@ -27,6 +27,7 @@ pub struct ScriptedChatStream {
     text: String,
     tool_calls: Vec<SimToolCall>,
     usage: Option<Usage>,
+    output_pacer: Option<StreamPacer>,
     on_complete: Option<OnCompleteCallback>,
 }
 
@@ -45,6 +46,7 @@ impl ScriptedChatStream {
             text,
             tool_calls,
             usage: None,
+            output_pacer: None,
             on_complete: None,
         }
     }
@@ -83,6 +85,12 @@ impl ScriptedChatStream {
         tokens
     }
 
+    #[cfg(feature = "server")]
+    pub(crate) fn with_output_pacer(mut self, pacer: Option<StreamPacer>) -> Self {
+        self.output_pacer = pacer;
+        self
+    }
+
     /// Render as SSE chunks for the HTTP body.
     pub fn into_stream(self) -> Pin<Box<dyn Stream<Item = String> + Send>> {
         let tokens = self.tokenize_text();
@@ -94,6 +102,9 @@ impl ScriptedChatStream {
         let usage = self.usage.clone();
         let on_complete = self.on_complete;
         let has_tool_calls = !tool_calls.is_empty();
+
+        let mut output_pacer = self.output_pacer;
+        let chunks = tokens.len() + tool_calls.len();
 
         Box::pin(stream! {
             // TTFT.
@@ -109,10 +120,7 @@ impl ScriptedChatStream {
 
             // Text deltas (if any).
             for token in tokens {
-                let tbt = latency.sample_tbt();
-                if !tbt.is_zero() {
-                    sleep(tbt).await;
-                }
+                pace_chunk(&mut output_pacer, chunks, || latency.sample_tbt()).await;
                 let chunk = ChatCompletionChunk::new(id.clone(), model.clone(), created)
                     .with_content(token);
                 yield format_sse(&chunk);
@@ -125,15 +133,15 @@ impl ScriptedChatStream {
             // staying simple — chunked-args streaming is overkill for
             // a test fixture.
             for (index, call) in tool_calls.iter().enumerate() {
-                let tbt = latency.sample_tbt();
-                if !tbt.is_zero() {
-                    sleep(tbt).await;
-                }
+                pace_chunk(&mut output_pacer, chunks, || latency.sample_tbt()).await;
 
                 let (announce, args_chunk) =
                     tool_call_chunks(&id, &model, created, index, call);
                 yield format_sse(&announce);
                 yield format_sse(&args_chunk);
+            }
+            if let Some(pacer) = output_pacer {
+                pacer.finish();
             }
 
             // Finish chunk.

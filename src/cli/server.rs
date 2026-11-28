@@ -41,6 +41,9 @@ pub enum ServerError {
 /// Build the application state for `config`, loading the script and
 /// scenario files it names.
 pub fn build_state(config: Config, stats: SharedStats) -> Result<AppState, ConfigError> {
+    for (pattern, profile) in &config.model_profiles {
+        profile.validate(pattern)?;
+    }
     if config.server.call_log && !super::call_log::is_loopback_ip(&config.server.host) {
         return Err(ConfigError::Validation(
             "server.call_log requires a loopback host".to_string(),

@@ -1,13 +1,19 @@
 // Server Configuration Module
 // Handles configuration from files and environment variables.
 
+use super::load_profile::{ModelProfile, TokenEstimate};
 use crate::{ErrorConfig, LatencyProfile};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
+    #[serde(default)]
+    pub token_estimate: TokenEstimate,
+    #[serde(default)]
+    pub model_profiles: BTreeMap<String, ModelProfile>,
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
@@ -264,6 +270,9 @@ pub struct LatencyConfig {
 /// Response generation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseConfig {
+    /// Allowed function names for inline turn shapes. Empty permits every offered function.
+    #[serde(default)]
+    pub shape_tool_allowlist: Vec<String>,
     /// Generator type: "lorem", "echo", "random", "sequence", "fixed:..."
     #[serde(default = "default_generator")]
     pub generator: String,
@@ -313,6 +322,7 @@ fn default_target_tokens() -> usize {
 impl Default for ResponseConfig {
     fn default() -> Self {
         Self {
+            shape_tool_allowlist: Vec::new(),
             generator: default_generator(),
             target_tokens: default_target_tokens(),
             script_path: None,
@@ -327,6 +337,9 @@ impl Default for ResponseConfig {
 /// Error injection configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ErrorsConfig {
+    /// Key injected faults to the conversation, step and SDK retry attempt.
+    #[serde(default)]
+    pub seed: Option<i64>,
     /// Rate of 429 rate limit errors (0.0-1.0)
     #[serde(default)]
     pub rate_limit_rate: f64,

@@ -11,6 +11,7 @@ mod gemini_handlers;
 mod handlers;
 mod jobs;
 pub mod limits;
+mod load_profile;
 pub mod prompt_cache;
 mod realtime;
 mod response_store;
@@ -22,6 +23,7 @@ pub mod validation;
 mod ws_handler;
 
 pub use config::{Config, ConfigError};
+pub use load_profile::{ModelProfile, TokenEstimate};
 pub use server::{build_state, start_server, ServerError, ServerHandle};
 pub use state::AppState;
 pub use ws_handler::ws_responses;

@@ -408,7 +408,7 @@ fn record_rejected(state: &AppState, status: u16) {
     state.stats.record_error(status);
 }
 
-fn with_retry_after(mut response: Response, wait: Duration) -> Response {
+pub(super) fn with_retry_after(mut response: Response, wait: Duration) -> Response {
     let secs = wait.as_secs_f64().ceil().max(1.0) as u64;
     insert(response.headers_mut(), "retry-after", secs.to_string());
     if let Ok(v) = HeaderValue::from_str(&wait.as_millis().max(1).to_string()) {
@@ -429,7 +429,12 @@ pub async fn middleware(
     };
     let now = Instant::now();
     let errors = &state.config.errors;
-    if errors.overload_burst_rate > 0.0 {
+    let seeded_endpoint = errors.seed.is_some()
+        && matches!(
+            request.uri().path(),
+            "/openai/v1/chat/completions" | "/openai/v1/responses" | "/anthropic/v1/messages"
+        );
+    if errors.overload_burst_rate > 0.0 && !seeded_endpoint {
         let burst = Duration::from_millis(errors.overload_burst_ms);
         if let Some(left) = state
             .limiter

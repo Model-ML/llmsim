@@ -1,5 +1,8 @@
 # Scenarios
 
+For compact turn markers and reproducible retries across replicas, see
+[multi-turn load tests](load-test-profiles.md).
+
 Scenarios replay realistic agent conversations for load tests: tool calls,
 long answers, reasoning, slow first tokens, mid-stream stalls, a 429 halfway,
 or a dropped stream. Many sessions can share one llmsim server, because the
